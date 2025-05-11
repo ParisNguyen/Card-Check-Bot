@@ -1,0 +1,224 @@
+import telegram
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+import requests
+from luhn import verify
+import stripe
+import pycountry
+import logging
+import time
+from datetime import datetime
+import os
+
+# Cấu hình từ biến môi trường
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
+PROXY = os.getenv("PROXY", "")
+CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "")
+
+# Thiết lập proxy
+proxies = {"http": PROXY, "https": PROXY} if PROXY else {}
+
+# Thiết lập Stripe
+stripe.api_key = STRIPE_API_KEY
+
+# Thiết lập logging
+logging.basicConfig(
+    filename="bot_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger()
+
+# Hàm kiểm tra loại thẻ qua BIN
+def get_card_type(card_number):
+    bin = card_number[:6]
+    try:
+        response = requests.get(f"https://lookup.binlist.net/{bin}", proxies=proxies, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        brand = data.get("brand", "Unknown")
+        country = pycountry.countries.get(alpha_2=data.get("country", {}).get("alpha2", ""))
+        country_name = country.name if country else "Unknown"
+        logger.info(f"Card BIN {bin}: Brand={brand}, Country={country_name}")
+        return brand, country_name
+    except requests.RequestException as e:
+        logger.error(f"Error fetching BIN {bin}: {str(e)}")
+        return "Unknown", "Unknown"
+
+# Hàm kiểm tra tính hợp lệ thẻ (Luhn Algorithm)
+def is_valid_card(card_number):
+    try:
+        valid = verify(card_number.replace(" ", ""))
+        logger.info(f"Card {card_number[:4]}****: Luhn check={'Valid' if valid else 'Invalid'}")
+        return valid
+    except Exception as e:
+        logger.error(f"Error validating card {card_number[:4]}****: {str(e)}")
+        return False
+
+# Hàm giả lập kiểm tra số dư (Stripe test mode)
+def check_balance(card_number, exp_month, exp_year, cvv):
+    try:
+        token = stripe.Token.create(
+            card={
+                "number": card_number,
+                "exp_month": exp_month,
+                "exp_year": exp_year,
+                "cvc": cvv
+            }
+        )
+        charge = stripe.Charge.create(
+            amount=100,  # 1 USD
+            currency="usd",
+            source=token.id,
+            description="Test charge"
+        )
+        logger.info(f"Card {card_number[:4]}****: Test charge successful")
+        return "Valid card. Test charge successful. (Balance check not available in test mode)"
+    except stripe.error.CardError as e:
+        logger.error(f"Card {card_number[:4]}**** declined: {e.user_message}")
+        return f"Card declined: {e.user_message}"
+    except Exception as e:
+        logger.error(f"Error charging card {card_number[:4]}****: {str(e)}")
+        return f"Error: {str(e)}"
+
+# Hàm xử lý CAPTCHA (2Captcha)
+def solve_captcha(site_key, url):
+    if not CAPTCHA_API_KEY:
+        return None
+    try:
+        response = requests.post(
+            "http://2captcha.com/in.php",
+            data={
+                "key": CAPTCHA_API_KEY,
+                "method": "userrecaptcha",
+                "googlekey": site_key,
+                "pageurl": url
+            },
+            proxies=proxies,
+            timeout=10
+        )
+        captcha_id = response.text.split("|")[1]
+        for _ in range(10):
+            result = requests.get(
+                f"http://2captcha.com/res.php?key={CAPTCHA_API_KEY}&action=get&id={captcha_id}",
+                proxies=proxies,
+                timeout=10
+            )
+            if "CAPCHA_NOT_READY" not in result.text:
+                captcha_solution = result.text.split("|")[1]
+                logger.info(f"CAPTCHA solved for {url}: {captcha_solution}")
+                return captcha_solution
+            time.sleep(5)
+        logger.warning(f"CAPTCHA timeout for {url}")
+        return None
+    except Exception as e:
+        logger.error(f"Error solving CAPTCHA for {url}: {str(e)}")
+        return None
+
+# Hàm xử lý lệnh /start
+def start(update, context):
+    user = update.message.from_user
+    logger.info(f"User {user.id} ({user.username}) started bot")
+    update.message.reply_text(
+        "🎉 Chào mừng bạn đến với Bot Kiểm Tra Thẻ (Test Mode)!\n\n"
+        "📋 Gửi thông tin thẻ theo định dạng:\n"
+        "Số thẻ | Tháng hết hạn | Năm hết hạn | CVV\n"
+        "Ví dụ: 4242424242424242 | 12 | 2025 | 123\n\n"
+        "⚠️ Chỉ sử dụng thẻ test (như Stripe test cards) để tránh rủi ro pháp lý.\n"
+        "Gõ /help để xem hướng dẫn chi tiết."
+    )
+
+# Hàm xử lý lệnh /help
+def help_command(update, context):
+    user = update.message.from_user
+    logger.info(f"User {user.id} ({user.username}) requested help")
+    update.message.reply_text(
+        "📖 Hướng dẫn sử dụng Bot:\n\n"
+        "1️⃣ Gửi thông tin thẻ theo định dạng:\n"
+        "   Số thẻ | Tháng hết hạn | Năm hết hạn | CVV\n"
+        "   Ví dụ: 4242424242424242 | 12 | 2025 | 123\n\n"
+        "2️⃣ Bot sẽ trả về:\n"
+        "   - Loại thẻ (Visa, MasterCard, v.v.)\n"
+        "   - Quốc gia phát hành\n"
+        "   - Trạng thái thẻ (hợp lệ hay không)\n\n"
+        "3️⃣ Thẻ test Stripe:\n"
+        "   - Visa: 4242424242424242\n"
+        "   - MasterCard: 5555555555554444\n"
+        "   - Amex: 378282246310005\n"
+        "   CVV bất kỳ, tháng/năm hết hạn sau ngày hiện tại.\n\n"
+        "📧 Liên hệ hỗ trợ: @YourSupportChannel"
+    )
+
+# Hàm xử lý thông tin thẻ
+def handle_card(update, context):
+    user = update.message.from_user
+    text = update.message.text
+    logger.info(f"User {user.id} ({user.username}) sent: {text}")
+
+    try:
+        card_number, exp_month, exp_year, cvv = text.split("|")
+        card_number = card_number.strip()
+        exp_month = int(exp_month.strip())
+        exp_year = int(exp_year.strip())
+        cvv = cvv.strip()
+
+        # Kiểm tra định dạng
+        if len(card_number) < 12 or len(card_number) > 19:
+            update.message.reply_text("❌ Số thẻ không hợp lệ (phải từ 12-19 chữ số).")
+            return
+        if exp_month < 1 or exp_month > 12:
+            update.message.reply_text("❌ Tháng hết hạn không hợp lệ (1-12).")
+            return
+        if exp_year < datetime.now().year:
+            update.message.reply_text("❌ Năm hết hạn phải sau ngày hiện tại.")
+            return
+        if len(cvv) < 3 or len(cvv) > 4:
+            update.message.reply_text("❌ CVV không hợp lệ (3-4 chữ số).")
+            return
+
+        # Kiểm tra tính hợp lệ thẻ
+        if not is_valid_card(card_number):
+            update.message.reply_text("❌ Thẻ không hợp lệ (Luhn check failed).")
+            return
+
+        # Kiểm tra loại thẻ
+        card_type, country = get_card_type(card_number)
+        update.message.reply_text(
+            f"✅ Kết quả kiểm tra:\n"
+            f"• Loại thẻ: {card_type}\n"
+            f"• Quốc gia: {country}"
+        )
+
+        # Giả lập kiểm tra số dư
+        balance_result = check_balance(card_number, exp_month, exp_year, cvv)
+        update.message.reply_text(f"• Trạng thái: {balance_result}")
+
+    except ValueError:
+        update.message.reply_text(
+            "❌ Lỗi định dạng. Vui lòng gửi đúng định dạng:\n"
+            "Số thẻ | Tháng hết hạn | Năm hết hạn | CVV\n"
+            "Ví dụ: 4242424242424242 | 12 | 2025 | 123"
+        )
+    except Exception as e:
+        logger.error(f"Error processing card for user {user.id}: {str(e)}")
+        update.message.reply_text(f"❌ Lỗi hệ thống: {str(e)}\nVui lòng thử lại hoặc liên hệ hỗ trợ.")
+
+# Hàm main
+def main():
+    try:
+        updater = Updater(TELEGRAM_TOKEN, use_context=True, request_kwargs={"proxy_url": PROXY} if PROXY else {})
+        dp = updater.dispatcher
+
+        dp.add_handler(CommandHandler("start", start))
+        dp.add_handler(CommandHandler("help", help_command))
+        dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_card))
+
+        logger.info("Bot started")
+        updater.start_polling()
+        updater.idle()
+    except Exception as e:
+        logger.error(f"Bot failed to start: {str(e)}")
+        print(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()

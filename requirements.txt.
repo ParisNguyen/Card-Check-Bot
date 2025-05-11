@@ -1,0 +1,5 @@
+python-telegram-bot==13.7
+requests==2.28.1
+stripe==5.0.0
+pycountry==22.3.5
+luhn==0.2.0

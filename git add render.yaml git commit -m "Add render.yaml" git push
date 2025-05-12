@@ -1,0 +1,18 @@
+# Exported from Render on 2025-05-12T01:06:54Z
+services:
+- type: web
+  name: Card-Check-Bot
+  runtime: python
+  repo: https://github.com/ParisNguyen/Card-Check-Bot
+  plan: free
+  envVars:
+  - key: PROXY
+    sync: false
+  - key: STRIPE_API_KEY
+    sync: false
+  - key: TELEGRAM_TOKEN
+    sync: false
+  region: oregon
+  buildCommand: pip install -r requirements.txt.
+  startCommand: python bot.py.
+version: "1"
